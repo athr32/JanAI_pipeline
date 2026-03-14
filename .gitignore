@@ -1,0 +1,11 @@
+.env
+janai_env/
+janai_vectordb/
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+whisper/
+stt/
+*.egg-info/
+.DS_Store
