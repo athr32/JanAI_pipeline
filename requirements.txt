@@ -1,0 +1,23 @@
+# JanAI — NLP Pipeline Requirements
+# Install with: pip install -r requirements.txt
+
+# ── Core AI/ML ────────────────────────────────────────────────
+transformers>=4.35.0          # HuggingFace models (BERT, BART)
+torch>=2.0.0                  # PyTorch backend
+sentence-transformers>=2.2.0  # Sentence embeddings for vector DB
+openai-whisper>=20231117      # Speech to text
+
+# ── Vector Database ───────────────────────────────────────────
+chromadb>=0.4.0               # Local vector database
+
+# ── Utilities ─────────────────────────────────────────────────
+numpy>=1.24.0
+scikit-learn>=1.3.0
+
+# ── Testing ───────────────────────────────────────────────────
+pytest>=7.4.0
+
+# ── API (for integration with FastAPI server) ─────────────────
+fastapi>=0.104.0
+uvicorn>=0.24.0
+python-multipart>=0.0.6       # for file uploads
