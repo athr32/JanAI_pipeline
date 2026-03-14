@@ -165,5 +165,4 @@ Sidebar shows red GROQ_API_KEY missing
 
 ## Built By
 JanAI Team — Hackathon 2026
-NLP Pipeline: [Your Name]
-Backend/FastAPI: [Teammate Name]
+NLP Pipeline: Atharva Antapurkar
