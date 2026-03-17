@@ -1,160 +1,134 @@
 # ================================================================
 #
-#   JanAI — WhatsApp Complaint Bot
-#   ================================
-#   Citizens send complaints via WhatsApp.
-#   Bot analyzes them using the full AI pipeline and replies
-#   with category, priority, complaint ID and department.
+#   JanAI — WhatsApp Complaint Bot (Groq-Only Version)
+#   ====================================================
+#   No heavy local models. Everything runs via Groq API.
+#   Startup: instant. Response time: 2-3 seconds.
 #
 #   HOW TO RUN:
 #   -----------
-#   1. pip install flask twilio
+#   1. pip install flask twilio groq python-dotenv
 #   2. ngrok http 5000             (in a separate terminal)
-#   3. Copy the ngrok URL → paste in Twilio sandbox webhook
+#   3. Copy ngrok URL → paste in Twilio sandbox webhook
 #   4. python whatsapp_bot.py
 #
-#   WEBHOOK URL TO SET IN TWILIO:
-#   https://xxxx-xx-xx.ngrok.io/webhook
+#   WEBHOOK URL FORMAT:
+#   https://xxxx-xx-xx.ngrok-free.app/webhook
 #
 # ================================================================
 
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
-import os
-import sys
+from groq import Groq
+import os, sys, json, uuid, datetime
 
-# ── Load .env (GROQ_API_KEY, TWILIO keys) ────────────────────────
+# ── Load .env ─────────────────────────────────────────────────────
 try:
     from dotenv import load_dotenv
     load_dotenv(override=True)
 except Exception:
     pass
 
-# ── Add project root to path so nlp/, vector_db/ etc. import ─────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# ── Twilio credentials from .env ──────────────────────────────────
 TWILIO_ACCOUNT_SID     = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN      = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
+GROQ_API_KEY           = os.environ.get("GROQ_API_KEY", "")
 
+groq_client = Groq(api_key=GROQ_API_KEY)
 app = Flask(__name__)
 
 
 # ================================================================
-#  TRANSLATION FUNCTION
-#  Same logic as app.py — translate Hindi to English before NLP
+#  GROQ ANALYSIS — single API call does everything
+#  Translate + Classify + Sentiment + Priority all at once
 # ================================================================
 
-def translate_to_english(text: str) -> str:
+def analyze_with_groq(complaint_text: str, population: int = 100) -> dict:
     """
-    Translate Hindi/Marathi complaint to English using Groq LLaMA.
-    Returns original text unchanged if translation fails.
+    Send complaint to Groq LLaMA — gets back full analysis as JSON.
+    One API call replaces BART + RoBERTa + translation.
+    Takes 2-3 seconds total.
     """
-    non_ascii = sum(1 for c in text if ord(c) > 127)
-    if non_ascii < len(text) * 0.2:
-        return text   # already English
+    prompt = f"""You are JanAI, an Indian civic complaint analysis system.
+Analyze this complaint and return ONLY a JSON object, nothing else.
 
-    api_key = os.environ.get("GROQ_API_KEY", "").strip()
-    if not api_key:
-        return text
+Complaint: "{complaint_text}"
+Population affected: {population}
 
+Return this exact JSON structure:
+{{
+  "translated": "English translation of complaint (same text if already English)",
+  "was_translated": true or false,
+  "category": one of ["roads and infrastructure", "water supply", "sanitation and garbage", "electricity", "healthcare", "education", "law and order", "public transport"],
+  "severity": one of ["HIGH", "MEDIUM", "LOW"],
+  "confidence": number between 0.0 and 1.0,
+  "sentiment": one of ["NEGATIVE", "NEUTRAL", "POSITIVE"],
+  "intensity": number between 0.0 and 1.0,
+  "priority_label": one of ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+  "priority_score": number between 0 and 100,
+  "urgency_reason": one sentence why this priority was assigned
+}}
+
+Hindi keyword guide:
+पानी/जल/नल = water supply
+सड़क/गड्ढा = roads and infrastructure  
+कूड़ा/कचरा/गंदगी = sanitation and garbage
+बिजली = electricity
+अस्पताल/डॉक्टर = healthcare
+स्कूल/शिक्षा = education
+पुलिस/अपराध = law and order
+बस/ट्रांसपोर्ट = public transport
+
+Priority rules:
+CRITICAL = score 50+, immediate danger to life
+HIGH     = score 30-49, major disruption
+MEDIUM   = score 15-29, moderate issue
+LOW      = score 0-14, minor issue
+
+Return ONLY valid JSON. No explanation before or after."""
+
+    response = groq_client.chat.completions.create(
+        model       = "llama-3.1-8b-instant",
+        messages    = [{"role": "user", "content": prompt}],
+        temperature = 0.0,
+        max_tokens  = 400,
+    )
+
+    raw = response.choices[0].message.content.strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+
+def save_to_vectordb(complaint_text: str, category: str,
+                     severity: str, location: str) -> str:
+    """
+    Save complaint to ChromaDB vector database.
+    Falls back to a generated UUID if ChromaDB is unavailable.
+    """
     try:
-        from groq import Groq
-        client = Groq(api_key=api_key)
-        response = client.chat.completions.create(
-            model    = "llama-3.1-8b-instant",
-            messages = [{
-                "role": "user",
-                "content": (
-                    f"Translate this Hindi/Marathi text to English. "
-                    f"Reply with ONLY the English translation, nothing else.\n\n"
-                    f"Text: {text}"
-                )
-            }],
-            temperature = 0.0,
-            max_tokens  = 300,
-        )
-        translated = response.choices[0].message.content.strip()
-        non_ascii_result = sum(1 for c in translated if ord(c) > 127)
-        if non_ascii_result > len(translated) * 0.3:
-            return text
-        return translated if translated else text
+        from vector_db.store import add_complaint
+        return add_complaint(complaint_text, category, severity, location)
     except Exception:
-        return text
+        # Fallback: generate a unique complaint ID without ChromaDB
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        short_id  = str(uuid.uuid4()).replace("-", "")[:8].upper()
+        return f"JAN-{timestamp}-{short_id}"
 
 
-# ================================================================
-#  CORE PIPELINE FUNCTION
-#  Runs the full AI pipeline on the complaint text
-# ================================================================
-
-def analyze_complaint(complaint_text: str, location: str = "Unknown", population: int = 100) -> dict:
-    """
-    Run the full JanAI NLP pipeline on a complaint.
-
-    Steps:
-      1. Detect language — translate Hindi to English if needed
-      2. NLP classification (BART) — category + severity
-      3. Sentiment analysis (RoBERTa) — negative intensity
-      4. Priority scoring — final score + label
-      5. Save to Vector DB — get complaint ID + recurrence count
-
-    Returns a dict with all results, or error info.
-    """
+def get_recurrence(complaint_text: str) -> int:
+    """Check how many similar complaints exist in vector DB."""
     try:
-        from nlp.classifier         import classify_issue
-        from nlp.sentiment          import analyze_sentiment
-        from vector_db.store        import add_complaint
-        from priority_engine.scorer import compute_priority_score
-
-        # Step 1 — Translate if Hindi/Marathi
-        english_text     = translate_to_english(complaint_text)
-        was_translated   = english_text != complaint_text
-
-        # Step 2 — NLP Classification
-        nlp_result       = classify_issue(english_text)
-
-        # Step 3 — Sentiment Analysis
-        sentiment_result = analyze_sentiment(english_text)
-
-        # Step 4 — Priority Scoring
-        priority_result  = compute_priority_score(english_text, population)
-
-        # Step 5 — Save to Vector DB (stores original language text)
-        complaint_id = add_complaint(
-            complaint_text,              # original Hindi preserved in DB
-            nlp_result["category"],
-            nlp_result["severity"],
-            location
-        )
-
-        return {
-            "success":        True,
-            "complaint_id":   complaint_id,
-            "english_text":   english_text,
-            "was_translated": was_translated,
-            "category":       nlp_result["category"],
-            "severity":       nlp_result["severity"],
-            "confidence":     nlp_result["confidence"],
-            "sentiment":      sentiment_result["sentiment"],
-            "intensity":      sentiment_result["negative_intensity"],
-            "priority_score": priority_result["total_score"],
-            "priority_label": priority_result["priority_label"],
-            "recurrence":     priority_result["recurrence_count"],
-        }
-
-    except Exception as e:
-        return {
-            "success": False,
-            "error":   str(e)
-        }
+        from vector_db.store import get_recurrence_count
+        return get_recurrence_count(complaint_text)
+    except Exception:
+        return 0
 
 
 # ================================================================
-#  MESSAGE FORMATTER
-#  Builds the WhatsApp reply message from pipeline results
+#  DEPARTMENT MAP
 # ================================================================
 
 DEPT_MAP = {
@@ -172,32 +146,32 @@ PRIORITY_EMOJI = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "
 SEVERITY_EMOJI = {"HIGH": "⚠️", "MEDIUM": "📋", "LOW": "ℹ️"}
 
 
-def build_reply(result: dict, original_text: str) -> str:
-    """Build a clean WhatsApp reply from the pipeline result."""
+# ================================================================
+#  REPLY BUILDER
+# ================================================================
 
-    if not result["success"]:
-        return (
-            "❌ *JanAI Error*\n\n"
-            f"Could not process your complaint:\n_{result['error']}_\n\n"
-            "Please try again or type *help*."
-        )
+def build_reply(analysis: dict, complaint_id: str,
+                recurrence: int, original_text: str) -> str:
 
-    label    = result["priority_label"]
-    score    = result["priority_score"]
-    category = result["category"].title()
-    dept     = DEPT_MAP.get(result["category"], "General Administration")
-    # Show only first 20 chars of complaint ID — enough to be unique
-    short_id = result["complaint_id"][:20]
+    label    = analysis.get("priority_label", "MEDIUM")
+    score    = analysis.get("priority_score", 0)
+    category = analysis.get("category", "unknown").title()
+    dept     = DEPT_MAP.get(analysis.get("category", ""), "General Administration")
+    conf     = int(analysis.get("confidence", 0.8) * 100)
+    sent     = analysis.get("sentiment", "NEGATIVE")
+    intens   = analysis.get("intensity", 0.5)
+    severity = analysis.get("severity", "MEDIUM")
+    reason   = analysis.get("urgency_reason", "")
+    short_id = complaint_id[:20]
 
     p_emoji = PRIORITY_EMOJI.get(label, "🔵")
-    s_emoji = SEVERITY_EMOJI.get(result["severity"], "📋")
+    s_emoji = SEVERITY_EMOJI.get(severity, "📋")
 
-    # Show translation if complaint was in Hindi
     translation_line = ""
-    if result["was_translated"]:
-        translation_line = f"\n🌐 _Translated: {result['english_text']}_\n"
+    if analysis.get("was_translated") and analysis.get("translated"):
+        translation_line = f"\n🌐 _Translated: {analysis['translated']}_\n"
 
-    reply = (
+    return (
         f"✅ *JanAI — Complaint Registered*\n"
         f"{'─' * 28}\n"
         f"\n"
@@ -209,12 +183,13 @@ def build_reply(result: dict, original_text: str) -> str:
         f"📊 *AI Analysis*\n"
         f"\n"
         f"🏷️ *Category:*  {category}\n"
-        f"   Confidence: {int(result['confidence'] * 100)}%\n"
+        f"   Confidence: {conf}%\n"
         f"\n"
         f"{p_emoji} *Priority:*  {label}  (Score: {score})\n"
-        f"{s_emoji} *Severity:*  {result['severity']}\n"
-        f"😠 *Sentiment:*  {result['sentiment']}  (Intensity: {result['intensity']:.2f})\n"
-        f"🔁 *Recurrence:*  Reported {result['recurrence']}x before\n"
+        f"{s_emoji} *Severity:*  {severity}\n"
+        f"😠 *Sentiment:*  {sent}  (Intensity: {intens:.2f})\n"
+        f"🔁 *Recurrence:*  Reported {recurrence}x before\n"
+        f"💡 _{reason}_\n"
         f"\n"
         f"{'─' * 28}\n"
         f"\n"
@@ -228,17 +203,15 @@ def build_reply(result: dict, original_text: str) -> str:
         f"{'─' * 28}\n"
         f"_JanAI Civic Intelligence · 2026_"
     )
-    return reply
 
 
 def build_help_message() -> str:
-    """Reply when user sends 'help' or a greeting."""
     return (
         "🧠 *Welcome to JanAI!*\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
         "I am an AI civic complaint system.\n"
-        "Send me your complaint in *English or Hindi*\n"
+        "Send your complaint in *English or Hindi*\n"
         "and I will:\n"
         "\n"
         "✅ Identify the category\n"
@@ -258,93 +231,137 @@ def build_help_message() -> str:
 
 # ================================================================
 #  FLASK WEBHOOK
-#  Twilio calls this URL every time a WhatsApp message arrives
 # ================================================================
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """
-    Main webhook — called by Twilio for every incoming WhatsApp message.
-
-    Flow:
-      1. Extract sender + message text from Twilio POST data
-      2. If help/greeting → send help message
-      3. Otherwise → run full AI pipeline
-      4. Build reply and send back via TwiML
-    """
     incoming_msg = request.values.get("Body", "").strip()
     sender       = request.values.get("From", "")
+    num_media    = int(request.values.get("NumMedia", 0))
+    media_type   = request.values.get("MediaContentType0", "")
+    media_url    = request.values.get("MediaUrl0", "")
 
     print(f"\n{'='*50}")
-    print(f"📱 From:    {sender}")
-    print(f"💬 Message: {incoming_msg}")
+    print(f"📱 From:      {sender}")
+    print(f"💬 Message:   {incoming_msg}")
+    print(f"📎 Media:     {num_media} — {media_type}")
     print(f"{'='*50}")
 
     resp = MessagingResponse()
     msg  = resp.message()
 
-    # ── Empty message ─────────────────────────────────────────────
-    if not incoming_msg:
-        msg.body("⚠️ Please send a complaint. Type *help* for instructions.")
+    # ── Handle voice/audio message ────────────────────────────────
+    if num_media > 0 and "audio" in media_type:
+        import tempfile
+        import requests as req
+        from requests.auth import HTTPBasicAuth
+        try:
+            audio_resp = req.get(
+                media_url,
+                auth    = HTTPBasicAuth(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+                timeout = 30
+            )
+            ext = ".ogg" if "ogg" in media_type else ".mp3"
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
+                f.write(audio_resp.content)
+                tmp_path = f.name
+            print(f"🎙️ Audio saved ({len(audio_resp.content)//1024} KB)")
+
+            with open(tmp_path, "rb") as af:
+                transcription = groq_client.audio.transcriptions.create(
+                    file            = (f"audio{ext}", af.read()),
+                    model           = "whisper-large-v3-turbo",
+                    response_format = "text",
+                    temperature     = 0.0,
+                )
+            os.unlink(tmp_path)
+
+            incoming_msg = (transcription if isinstance(transcription, str)
+                            else getattr(transcription, "text", "")).strip()
+            print(f"📝 Transcribed: {incoming_msg}")
+
+            if not incoming_msg:
+                msg.body("⚠️ Could not transcribe your voice note. Please speak clearly or type your complaint.")
+                return str(resp)
+
+            # Tell user what was heard
+            try:
+                Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).messages.create(
+                    from_ = TWILIO_WHATSAPP_NUMBER,
+                    to    = sender,
+                    body  = f"🎙️ *Voice transcribed:*\n_{incoming_msg}_\n\n⏳ Analyzing..."
+                )
+            except Exception:
+                pass
+
+        except Exception as e:
+            print(f"❌ Voice error: {e}")
+            msg.body(f"❌ Could not process voice message.\nPlease type your complaint instead.")
+            return str(resp)
+
+    # ── Empty text message ────────────────────────────────────────
+    elif not incoming_msg:
+        msg.body("⚠️ Please send a text or voice complaint. Type *help* for instructions.")
         return str(resp)
 
-    # ── Help / greeting ───────────────────────────────────────────
     greetings = ["help", "hi", "hello", "helo", "hey", "start",
                  "menu", "नमस्ते", "हेलो", "hai"]
     if incoming_msg.lower() in greetings:
         msg.body(build_help_message())
         return str(resp)
 
-    # ── Extract location hint from message ────────────────────────
+    # Extract location hint
     location = "Unknown Location"
     for keyword in [" in ", " at ", " near ", " on "]:
         if keyword in incoming_msg.lower():
-            parts = incoming_msg.lower().split(keyword, 1)
-            if len(parts) > 1:
-                loc_words = parts[1].split()[:4]
-                location  = " ".join(loc_words).title()
+            parts     = incoming_msg.lower().split(keyword, 1)
+            loc_words = parts[1].split()[:4]
+            location  = " ".join(loc_words).title()
             break
 
-    # ── Send acknowledgment via REST (pipeline takes ~3-5 sec) ────
-    ack_sent = False
+    # Send acknowledgment
     if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
         try:
-            client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-            client.messages.create(
+            Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).messages.create(
                 from_ = TWILIO_WHATSAPP_NUMBER,
                 to    = sender,
-                body  = "⏳ *JanAI* is analyzing your complaint...\n_Please wait 3-5 seconds._"
+                body  = "⏳ *JanAI* is analyzing your complaint...\n_Takes 2-3 seconds._"
             )
-            ack_sent = True
         except Exception as e:
             print(f"⚠️ Ack failed: {e}")
 
-    # ── Run the AI pipeline ───────────────────────────────────────
-    print(f"🔄 Analyzing: {incoming_msg[:60]}...")
-    result = analyze_complaint(
-        complaint_text = incoming_msg,
-        location       = location,
-        population     = 100
-    )
+    # Run Groq analysis
+    print(f"🔄 Analyzing with Groq...")
+    try:
+        analysis   = analyze_with_groq(incoming_msg)
+        complaint_id = save_to_vectordb(
+            incoming_msg,
+            analysis.get("category", "unknown"),
+            analysis.get("severity", "MEDIUM"),
+            location
+        )
+        recurrence = get_recurrence(incoming_msg)
+        reply_text = build_reply(analysis, complaint_id, recurrence, incoming_msg)
+        print(f"✅ Done. Priority: {analysis.get('priority_label')} | ID: {complaint_id[:16]}")
 
-    reply_text = build_reply(result, incoming_msg)
-    print(f"✅ Done. Priority: {result.get('priority_label', 'ERROR')}")
-    print(f"🆔 ID: {result.get('complaint_id', 'N/A')}")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        reply_text = (
+            f"❌ *JanAI Error*\n\n"
+            f"Could not analyze complaint: {str(e)[:100]}\n\n"
+            f"Please try again."
+        )
 
-    # ── Send reply ────────────────────────────────────────────────
-    if ack_sent:
-        # Already sent ack via REST — send reply via REST too
-        try:
-            client.messages.create(
-                from_ = TWILIO_WHATSAPP_NUMBER,
-                to    = sender,
-                body  = reply_text
-            )
-            msg.body("")   # empty TwiML since we sent via REST
-        except Exception as e:
-            print(f"⚠️ REST reply failed: {e}")
-            msg.body(reply_text)
-    else:
+    # Send reply via REST
+    try:
+        Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).messages.create(
+            from_ = TWILIO_WHATSAPP_NUMBER,
+            to    = sender,
+            body  = reply_text
+        )
+        msg.body("")
+    except Exception as e:
+        print(f"⚠️ REST send failed: {e}")
         msg.body(reply_text)
 
     return str(resp)
@@ -352,54 +369,46 @@ def webhook():
 
 @app.route("/", methods=["GET"])
 def home():
-    """Health check page — open in browser to verify server is running."""
     return """
-    <html>
-    <body style="font-family:monospace;background:#050A1A;color:#00D4FF;padding:40px;">
-      <h1>🧠 JanAI WhatsApp Bot</h1>
-      <p style="color:#00FF9D;">✅ Server is running</p>
-      <p style="color:#E2EAF4;">Webhook: <strong>/webhook</strong></p>
-      <p style="color:#6B8CAE;">
-        Set your full ngrok URL + /webhook in the Twilio sandbox settings.
-      </p>
-    </body>
-    </html>
+    <html><body style="font-family:monospace;background:#050A1A;color:#00D4FF;padding:40px;">
+    <h1>🧠 JanAI WhatsApp Bot</h1>
+    <p style="color:#00FF9D;">✅ Server is running</p>
+    <p style="color:#6B8CAE;">Webhook: <strong style="color:#E2EAF4;">/webhook</strong></p>
+    </body></html>
     """
 
 
 # ================================================================
-#  STARTUP CHECKS + RUN
+#  STARTUP
 # ================================================================
 
 if __name__ == "__main__":
     print("\n" + "=" * 50)
-    print("🧠  JanAI WhatsApp Bot")
+    print("🧠  JanAI WhatsApp Bot  (Groq-Only)")
     print("=" * 50)
 
-    # Check all required environment variables
     checks = {
-        "GROQ_API_KEY":           os.environ.get("GROQ_API_KEY", ""),
-        "TWILIO_ACCOUNT_SID":     os.environ.get("TWILIO_ACCOUNT_SID", ""),
-        "TWILIO_AUTH_TOKEN":      os.environ.get("TWILIO_AUTH_TOKEN", ""),
-        "TWILIO_WHATSAPP_NUMBER": os.environ.get("TWILIO_WHATSAPP_NUMBER", ""),
+        "GROQ_API_KEY":           GROQ_API_KEY,
+        "TWILIO_ACCOUNT_SID":     TWILIO_ACCOUNT_SID,
+        "TWILIO_AUTH_TOKEN":      TWILIO_AUTH_TOKEN,
+        "TWILIO_WHATSAPP_NUMBER": TWILIO_WHATSAPP_NUMBER,
     }
-
     all_ok = True
     for key, val in checks.items():
         if val:
             print(f"  ✅  {key}: ...{val[-6:]}")
         else:
-            print(f"  ❌  {key}: MISSING — add to .env file")
+            print(f"  ❌  {key}: MISSING")
             all_ok = False
 
-    if not all_ok:
-        print("\n⚠️  Some keys missing. Check your .env file.")
-    else:
+    if all_ok:
         print("\n✅  All keys loaded. Bot ready!")
+    else:
+        print("\n⚠️  Some keys missing. Check your .env file.")
 
-    print("\n📡  Flask running at:  http://localhost:5000")
-    print("🔗  Webhook endpoint:  http://localhost:5000/webhook")
-    print("⚡  ngrok command:     ngrok http 5000")
+    print("\n📡  Flask: http://localhost:5000")
+    print("🔗  Webhook: http://localhost:5000/webhook")
+    print("⚡  Run in another terminal: ngrok http 5000")
     print("=" * 50 + "\n")
 
-    app.run(debug=True, port=5000)
+    app.run(debug=False, port=5000)
